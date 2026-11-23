@@ -32,7 +32,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-WORKER_VERSION = '2.0-direct-clang-swiftc'
+WORKER_VERSION = '2.1-server-sdk'
 
 BASE = os.environ.get('SCL_BASE_URL', '').strip().rstrip('/')
 TOKEN = os.environ.get('SCL_WORKER_TOKEN', '').strip()
@@ -109,6 +109,35 @@ def find_sdk_src():
     return p if os.path.isdir(p) else None
 
 
+def download_sdk(dest_dir):
+    """从站点拉取最新 SDK 源码 zip 并解压，返回解压后的 sdk_src 目录。
+    这样仓库里只需要 worker.py，源码永远以后台服务器上的为准。"""
+    url = BASE + '/api/sdkzip.php?' + urllib.parse.urlencode({'token': TOKEN})
+    req = urllib.request.Request(url, headers={
+        'X-SCL-Token': TOKEN,
+        'Authorization': 'Bearer ' + TOKEN,
+        'User-Agent': 'SCLBuildWorker/' + WORKER_VERSION,
+    })
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = r.read()
+    if len(data) < 200:
+        raise RuntimeError('SDK 包过小(%d 字节)' % len(data))
+
+    zip_path = os.path.join(dest_dir, 'sdk.zip')
+    with open(zip_path, 'wb') as f:
+        f.write(data)
+
+    target = os.path.join(dest_dir, 'sdk_src')
+    os.makedirs(target, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        # 防目录穿越
+        for name in z.namelist():
+            if '..' in name or name.startswith('/'):
+                raise RuntimeError('SDK 包内含非法路径: ' + name)
+        z.extractall(target)
+    return target
+
+
 def sdk_path(name):
     code, out = run(['xcrun', '--sdk', name, '--show-sdk-path'])
     if code != 0:
@@ -182,14 +211,19 @@ def build_dylib(job):
     cfg_url = BASE + '/api/config.php?app_id=' + app_id
     act_url = BASE + '/api/activate.php'
 
-    sdk_src = find_sdk_src()
-    if not sdk_src:
-        raise RuntimeError('worker 同级目录未找到 sdk_src')
-
     work = tempfile.mkdtemp(prefix='sclbuild_')
     try:
-        src = os.path.join(work, 'sdk_src')
-        shutil.copytree(sdk_src, src)
+        # 优先从站点拉取最新源码（保证与后台一致）；失败则回退仓库内 sdk_src
+        try:
+            src = download_sdk(work)
+            report_log(jid, '已从服务器拉取最新 SDK 源码')
+        except Exception as e:
+            local = find_sdk_src()
+            if not local:
+                raise RuntimeError('无法获取 SDK 源码（服务器拉取失败: %s，且仓库内无 sdk_src）' % e)
+            src = os.path.join(work, 'sdk_src')
+            shutil.copytree(local, src)
+            report_log(jid, '服务器拉取失败(%s)，改用仓库内 sdk_src' % e)
 
         # 固化客户配置
         cfg_file = os.path.join(src, 'SCLAlertView', 'BackendControl', 'SCLCustomerConfig.swift')
