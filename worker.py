@@ -106,10 +106,7 @@ def build_dylib(job, sdk_src):
             s = s.replace(k, v)
         open(cfg_file, 'w', encoding='utf-8').write(s)
 
-        report_log(job['id'], '切换到 dylib 构建清单...')
-        shutil.copy(os.path.join(dst, 'Package-dylib.swift'), os.path.join(dst, 'Package.swift'))
-
-        report_log(job['id'], '编译真机 arm64 dylib...')
+        report_log(job['id'], '编译 dylib（clang + swiftc）...')
         subprocess.check_call(['chmod', '+x', os.path.join(dst, 'build_dylib.sh')])
         # 直接调用构建脚本；脚本内部产出 zip
         env = os.environ.copy()
