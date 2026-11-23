@@ -1,0 +1,4 @@
+module SCLAlertViewObjC {
+  header "SCLDylibEntry.h"
+  export *
+}

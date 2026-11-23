@@ -1,0 +1,62 @@
+GitHub 构建仓库 - 上传说明
+======================================
+
+这个 zip 里的内容直接上传到你的 GitHub 仓库根目录：
+  worker.py                          （根目录）
+  sdk_src/                           （整个目录）
+  .github/workflows/scl-build.yml    （注意这个隐藏目录）
+
+【从零开始步骤】
+
+1. 注册/登录 GitHub（github.com）。
+
+2. 新建仓库：点右上角 + → New repository
+   - Repository name: 随便填，如 scl-builder
+   - 选 Private（私有，推荐）或 Public
+   - 勾选 "Add a README file"
+   - 点 Create repository
+
+3. 把本 zip 的内容上传到仓库：
+   在这个仓库页面点 "Add file" → "Upload files"，
+   把本 zip 解压后的全部文件/文件夹拖进去（worker.py、sdk_src 文件夹、.github 文件夹），
+   点 Commit changes。
+   注意：.github 是隐藏文件夹，解压时要显示隐藏文件才能看到。
+
+4. 生成 PAT（Personal Access Token）：
+   右上角头像 → Settings → 最底部 Developer settings
+   → Personal access tokens → Tokens (classic) → Generate new token (classic)
+   - Note: 随便填，如 scl
+   - Expiration: 选 90 days 或 No expiration
+   - 勾选权限: 
+       * 私有仓库勾 [repo]（整个）
+       * 公开仓库勾 [public_repo] 和 [workflow]
+   - 拉到最底点 Generate token
+   - 复制那串 ghp_ 开头的 token（只显示一次！）
+
+5. 回到你的 PHP 后台 → 构建节点设置：
+   - 构建节点 Token: 点"生成随机 Token" → 保存
+   - GitHub 用户名/组织: 你的 GitHub 用户名
+   - 仓库名: 第 2 步的仓库名（如 scl-builder）
+   - PAT: 第 4 步的 ghp_... 
+   - 分支: main
+   - workflow 文件名: scl-build.yml
+   - 点"保存 GitHub 触发配置"
+
+6. 同样在"构建节点设置"页面，把"SCL_BASE_URL"和"SCL_WORKER_TOKEN"的值
+   配到 GitHub 仓库的 Secrets：
+   仓库页面 → Settings → Secrets and variables → Actions → New repository secret
+   - 名字 SCL_BASE_URL，值 = 页面显示的你的站点地址（https 开头）
+   - 名字 SCL_WORKER_TOKEN，值 = 第 5 步的构建节点 Token
+   两个都要加。
+
+7. 去仓库的 Actions 标签页，点左边 "SCL Dylib Auto Build" → 右边 "Run workflow"
+   → 点 Run，确认能跑起来（ Logs 里应显示 worker 启动、无报错）。
+
+8. 回到 PHP 后台"在线打包"，点打包或"重新触发"。这次会立即触发云端编译。
+
+【常见问题】
+- 触发返回 HTTP 401: PAT 错或过期 → 重新生成 PAT
+- HTTP 404: 仓库名/用户名/workflow 文件名错 → 核对
+- HTTP 422: 分支名错 → 确认仓库默认分支是 main 还是 master
+- Actions 跑起来但报 "缺少 worker.py 或 sdk_src" → 第 3 步没传全，补传
+- Actions 报 "bad token" → 第 6 步 SCL_WORKER_TOKEN 与后台不一致
