@@ -235,7 +235,7 @@ def build_dylib(job):
             '__SCL_ACTIVATE_URL__': act_url,
             '__SCL_APP_ID__': app_id,
             '__SCL_SECRET__': secret,
-            '__SCL_POLL__': '300',
+            '__SCL_POLL__': '15',
         }.items():
             content = content.replace(k, v)
         open(cfg_file, 'w', encoding='utf-8').write(content)
@@ -269,11 +269,21 @@ def build_dylib(job):
                 '  iphoneos/SCLAlertView.dylib    真机 arm64\n'
                 '  simulator/SCLAlertView.dylib   模拟器 arm64\n\n'
                 '域名/AppID/密钥已固化进二进制。dylib 被加载时 constructor 自动连接后台并弹窗。\n\n'
-                '使用方式：\n'
-                '  真机：放入 App 的 Frameworks 目录，用 insert_dylib 注入 LC_LOAD_DYLIB，\n'
-                '        然后 codesign --force --sign <证书> 重签整个 App。\n'
-                '  模拟器：DYLD_INSERT_LIBRARIES=/path/SCLAlertView.dylib 启动。\n'
-                '  Frida：Module.load("/path/SCLAlertView.dylib")\n\n'
+                '推荐用法（真机注入，一条命令）：\n'
+                '  chmod +x inject.sh\n'
+                '  ./inject.sh app.ipa iphoneos/SCLAlertView.dylib "签名证书名" out.ipa\n'
+                '  脚本会自动校验架构、注入、按正确顺序重签、并验证 LC_LOAD_DYLIB。\n\n'
+                '手动注入（注意顺序）：\n'
+                '  1) cp SCLAlertView.dylib Payload/App.app/Frameworks/\n'
+                '  2) insert_dylib --inplace --all-yes @executable_path/Frameworks/SCLAlertView.dylib Payload/App.app/App\n'
+                '  3) codesign -f -s "证书" Payload/App.app/Frameworks/SCLAlertView.dylib\n'
+                '  4) codesign -f -s "证书" Payload/App.app\n'
+                '  不要加 --weak，否则加载失败会被静默忽略，表现为"注入没效果"。\n\n'
+                '验证是否真的加载了（连设备看日志，过滤 SCLDylib）：\n'
+                '  mac: idevicesyslog | grep SCLDylib\n'
+                '  正常会打印: [SCLDylib] constructor 已触发 / 配置已固化=true / 后台连通正常\n\n'
+                '模拟器：DYLD_INSERT_LIBRARIES=/path/SCLAlertView.dylib 启动。\n'
+                'Frida：Module.load("/path/SCLAlertView.dylib")\n\n'
                 '配置接口: %s\n激活接口: %s\n'
                 % (customer, app_id, time.strftime('%Y-%m-%d %H:%M:%S'), cfg_url, act_url)
             )
@@ -281,6 +291,17 @@ def build_dylib(job):
             json.dump({'customer': customer, 'app_id': app_id,
                        'config_url': cfg_url, 'activate_url': act_url},
                       f, ensure_ascii=False, indent=2)
+
+        # 附带注入脚本，客户/自己一条命令完成注入
+        inject_src = os.path.join(src, 'tools', 'inject.sh')
+        if os.path.isfile(inject_src):
+            inject_dst = os.path.join(outdir, 'inject.sh')
+            shutil.copy(inject_src, inject_dst)
+            try:
+                os.chmod(inject_dst, 0o755)
+            except Exception:
+                pass
+            report_log(jid, '已附带 inject.sh 注入脚本')
 
         # 打包 zip
         zip_path = os.path.join(work, 'dylib.zip')
