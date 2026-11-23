@@ -13,13 +13,23 @@ SCLAlertView 云端构建 worker（在 macOS 上运行；GitHub Actions macos ru
 """
 import os, sys, json, time, base64, urllib.request, urllib.parse, urllib.error, tempfile, shutil, subprocess
 
-BASE = os.environ.get('SCL_BASE_URL', '').rstrip('/')
-TOKEN = os.environ.get('SCL_WORKER_TOKEN', '')
+BASE = os.environ.get('SCL_BASE_URL', '').strip().rstrip('/')
+TOKEN = os.environ.get('SCL_WORKER_TOKEN', '').strip()
 ONCE = os.environ.get('SCL_ONCE', '0') == '1'
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# 容错：去掉误填的 /admin、/api 后缀
+for suffix in ('/admin', '/api'):
+    if BASE.endswith(suffix):
+        BASE = BASE[:-len(suffix)]
+
 if not BASE or not TOKEN:
-    sys.exit('需要设置 SCL_BASE_URL 与 SCL_WORKER_TOKEN')
+    sys.exit('缺少环境变量：SCL_BASE_URL=%r SCL_WORKER_TOKEN长度=%d。'
+             '请在 GitHub 仓库 Settings > Secrets and variables > Actions 配置这两个 Secret。'
+             % (BASE, len(TOKEN)))
+
+if not BASE.startswith('http'):
+    sys.exit('SCL_BASE_URL 必须以 http:// 或 https:// 开头，当前: ' + BASE)
 
 
 def api(params, post=None, headers=None):
@@ -162,8 +172,20 @@ def process_one(job):
 
 
 def main():
-    print('SCL 构建 worker 启动', BASE)
-    hb_count = 0
+    print('SCL 构建 worker 启动')
+    print('  BASE  =', BASE)
+    print('  TOKEN = 长度', len(TOKEN))
+
+    # 启动连通性自检：GitHub runner 能否访问你的站点
+    probe = api({'action': 'heartbeat', 'v': '1.2'})
+    if probe.get('error'):
+        print('!! 连接站点失败:', probe['error'])
+        print('!! 请确认 SCL_BASE_URL 是公网可访问的 https 地址，且 /api/job.php 未被防火墙/CC 防护拦截')
+        if ONCE:
+            sys.exit(1)
+    else:
+        print('== 站点连接正常 ==')
+
     while True:
         # 每轮先上报心跳（让网页能看到节点是否在线）
         hb = api({'action': 'heartbeat', 'v': '1.1'})
