@@ -54,9 +54,21 @@ GitHub 构建仓库 - 上传说明
 
 8. 回到 PHP 后台"在线打包"，点打包或"重新触发"。这次会立即触发云端编译。
 
+【重要：只保留一个工作流】
+.github/workflows/ 目录里【只能有 scl-build.yml】。
+如果还有别的工作流（例如 xcodebuild 模板、iOS Build 之类），必须删掉。
+判断方法：Actions 页面左侧列表应该只有一个 "SCL Dylib Auto Build"。
+如果你的运行日志里出现 "xcodebuild -list"、Ruby JSON 报错、或
+"does not contain an Xcode project"，说明跑的是别的工作流，删掉它即可。
+
+本工作流只运行 python3 worker.py，不需要仓库根目录有 Xcode 工程；
+Xcode 工程会在编译时由 sdk_src/make_xcodeproj.py 自动生成。
+
 【常见问题】
 - 触发返回 HTTP 401: PAT 错或过期 → 重新生成 PAT
+- HTTP 403 Resource not accessible: PAT 权限不足 → Fine-grained 加 Actions: Read and write + Contents: Read
 - HTTP 404: 仓库名/用户名/workflow 文件名错 → 核对
-- HTTP 422: 分支名错 → 确认仓库默认分支是 main 还是 master
+- HTTP 422: 分支名错 → 确认默认分支是 main 还是 master
 - Actions 跑起来但报 "缺少 worker.py 或 sdk_src" → 第 3 步没传全，补传
 - Actions 报 "bad token" → 第 6 步 SCL_WORKER_TOKEN 与后台不一致
+- 日志出现 xcodebuild -list / Ruby JSON 错误 → 仓库里有别的工作流，删掉
