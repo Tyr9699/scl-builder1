@@ -1,21 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SCLAlertView 云端构建 worker（在 macOS 上运行；GitHub Actions macos runner 或常驻 Mac）
-流程：拉取任务 -> 下载 SDK 源码包 -> 固化客户配置 -> 编译 dylib -> 回传产物。
-你（网页操作者）不需要 Mac，这个 worker 跑在云端。
+SCLAlertView 云端构建 worker（自包含版 v2.0）
+
+本文件内含完整编译逻辑，不依赖 build_dylib.sh / Package.swift / SwiftPM：
+  1. 固化客户配置到 SCLCustomerConfig.swift
+  2. clang 编译 SCLDylibEntry.m（constructor 入口）
+  3. swiftc 把全部 .swift + 上面的 .o 链接成 Mach-O dylib
+  4. ad-hoc 签名、打包 zip、回传
+
+为什么不用 SwiftPM：SwiftPM 不支持同一 target 混用 Swift 与 Objective-C，
+会报 "contains mixed language source files; feature not supported"。
 
 环境变量：
-  SCL_BASE_URL     宝塔站点根地址，如 https://your.domain
-  SCL_WORKER_TOKEN 后台生成的构建节点 token
+  SCL_BASE_URL     站点根地址，如 https://your.domain
+  SCL_WORKER_TOKEN 后台「构建节点设置」里的 Token
 可选：
-  SCL_ONCE=1       只处理一个任务后退出（适合 GitHub Actions 定时触发）
+  SCL_ONCE=1       处理一个任务后退出（GitHub Actions 用）
+  SCL_JOB_ID       指定要处理的任务 ID（dispatch 触发时传入）
 """
-import os, sys, json, time, base64, urllib.request, urllib.parse, urllib.error, tempfile, shutil, subprocess
+import os
+import sys
+import json
+import time
+import base64
+import shutil
+import tempfile
+import zipfile
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+
+WORKER_VERSION = '2.0-direct-clang-swiftc'
 
 BASE = os.environ.get('SCL_BASE_URL', '').strip().rstrip('/')
 TOKEN = os.environ.get('SCL_WORKER_TOKEN', '').strip()
 ONCE = os.environ.get('SCL_ONCE', '0') == '1'
+FORCED_JOB = os.environ.get('SCL_JOB_ID', '').strip()
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 容错：去掉误填的 /admin、/api 后缀
@@ -24,7 +46,7 @@ for suffix in ('/admin', '/api'):
         BASE = BASE[:-len(suffix)]
 
 if not BASE or not TOKEN:
-    sys.exit('缺少环境变量：SCL_BASE_URL=%r SCL_WORKER_TOKEN长度=%d。'
+    sys.exit('缺少环境变量：SCL_BASE_URL=%r SCL_WORKER_TOKEN长度=%d\n'
              '请在 GitHub 仓库 Settings > Secrets and variables > Actions 配置这两个 Secret。'
              % (BASE, len(TOKEN)))
 
@@ -32,70 +54,148 @@ if not BASE.startswith('http'):
     sys.exit('SCL_BASE_URL 必须以 http:// 或 https:// 开头，当前: ' + BASE)
 
 
-def api(params, post=None, headers=None):
-    """调用宝塔 API，返回 dict。token 同时放在 query / header / Authorization，
-    兼容 nginx 过滤自定义 header 的情况。"""
-    # token 放进 query（最稳，后端 env 允许 GET/REQUEST）
-    all_params = dict(params)
-    all_params.setdefault('token', TOKEN)
-    url = BASE + '/api/job.php?' + urllib.parse.urlencode(all_params)
-    h = {
+# ============ API ============
+
+def api(params, post=None):
+    """调用站点 API；token 同时放 query / header / POST 体，兼容 nginx 过滤 header。"""
+    p = dict(params)
+    p.setdefault('token', TOKEN)
+    url = BASE + '/api/job.php?' + urllib.parse.urlencode(p)
+    headers = {
         'X-SCL-Token': TOKEN,
         'Authorization': 'Bearer ' + TOKEN,
-        'User-Agent': 'SCLBuildWorker/1.0',
+        'User-Agent': 'SCLBuildWorker/' + WORKER_VERSION,
     }
-    if headers:
-        h.update(headers)
     data = None
     if post is not None:
-        post = dict(post)
-        post.setdefault('token', TOKEN)   # POST 体里也带一份
-        data = urllib.parse.urlencode(post).encode()
-        h['Content-Type'] = 'application/x-www-form-urlencoded'
-    req = urllib.request.Request(url, data=data, headers=h)
+        body = dict(post)
+        body.setdefault('token', TOKEN)
+        data = urllib.parse.urlencode(body).encode()
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
-        body = ''
+        detail = ''
         try:
-            body = e.read().decode('utf-8', 'ignore')[:200]
+            detail = e.read().decode('utf-8', 'ignore')[:300]
         except Exception:
             pass
-        return {'error': 'HTTP %s %s' % (e.code, body)}
+        return {'error': 'HTTP %s %s' % (e.code, detail)}
     except Exception as e:
         return {'error': str(e)}
 
 
 def report_log(job_id, line):
-    api({'action': 'log', 'id': job_id, 'line': line})
-    print('  ', line)
+    line = str(line).replace(BASE, '<站点>')
+    api({'action': 'log', 'id': job_id, 'line': line[:400]})
+    print(line)
 
+
+def run(cmd, cwd=None):
+    """执行命令，返回 (returncode, 合并输出)。"""
+    proc = subprocess.run(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, timeout=1800
+    )
+    return proc.returncode, (proc.stdout or '')
+
+
+# ============ 编译 ============
 
 def find_sdk_src():
-    """SDK 源码位置：worker 同级 sdk_src/ 或从站点下载。"""
     p = os.path.join(HERE, 'sdk_src')
-    if os.path.isdir(p):
-        return p
-    return None
+    return p if os.path.isdir(p) else None
 
 
-def build_dylib(job, sdk_src):
-    """在 macOS 上编译成品 dylib，返回 zip 字节。"""
+def sdk_path(name):
+    code, out = run(['xcrun', '--sdk', name, '--show-sdk-path'])
+    if code != 0:
+        raise RuntimeError('xcrun 获取 SDK 失败(%s): %s' % (name, out.strip()[:300]))
+    return out.strip()
+
+
+def build_platform(src_dir, job_id, sdk_name, triple, arch, out_file, tag):
+    """编译单个平台的 dylib。分 clang 编 ObjC、swiftc 链接两步，绕开 SwiftPM 混合语言限制。"""
+    root = os.path.join(src_dir, 'SCLAlertView')
+    objc_file = os.path.join(root, 'BackendControl', 'SCLDylibEntry.m')
+    swift_files = []
+    for dirpath, _, files in os.walk(root):
+        for f in sorted(files):
+            if f.endswith('.swift'):
+                swift_files.append(os.path.join(dirpath, f))
+    swift_files.sort()
+
+    if not swift_files:
+        raise RuntimeError('未找到任何 .swift 源文件')
+    if not os.path.isfile(objc_file):
+        raise RuntimeError('缺少 BackendControl/SCLDylibEntry.m')
+
+    report_log(job_id, '[%s] Swift 文件 %d 个，开始编译' % (tag, len(swift_files)))
+    sdk = sdk_path(sdk_name)
+    obj_dir = os.path.join(HERE, '.obj-%s' % tag)
+    if os.path.isdir(obj_dir):
+        shutil.rmtree(obj_dir, ignore_errors=True)
+    os.makedirs(obj_dir, exist_ok=True)
+    objc_obj = os.path.join(obj_dir, 'SCLDylibEntry.o')
+
+    # 步骤 1：clang 编 Objective-C（constructor 入口）
+    cmd = ['xcrun', '--sdk', sdk_name, 'clang',
+           '-arch', arch, '-isysroot', sdk, '-fobjc-arc', '-O2',
+           '-c', objc_file, '-o', objc_obj]
+    code, out = run(cmd)
+    if out.strip():
+        for line in out.strip().splitlines()[-20:]:
+            report_log(job_id, '[%s] ' % tag + line)
+    if code != 0:
+        raise RuntimeError('clang 编译 ObjC 失败(退出码 %d)' % code)
+
+    # 步骤 2：swiftc 把 Swift + ObjC 对象链接成 dylib
+    cmd = ['swiftc', '-emit-library', '-O', '-parse-as-library',
+           '-module-name', 'SCLAlertView',
+           '-target', triple, '-sdk', sdk,
+           '-framework', 'UIKit', '-framework', 'Foundation',
+           '-Xlinker', '-install_name', '-Xlinker', '@rpath/SCLAlertView.dylib',
+           '-Xlinker', '-rpath', '-Xlinker', '/usr/lib/swift',
+           '-o', out_file] + swift_files + [objc_obj]
+    code, out = run(cmd)
+    if out.strip():
+        for line in out.strip().splitlines()[-40:]:
+            report_log(job_id, '[%s] ' % tag + line)
+    if code != 0:
+        raise RuntimeError('swiftc 链接失败(退出码 %d)' % code)
+
+    if not os.path.isfile(out_file) or os.path.getsize(out_file) < 1024:
+        raise RuntimeError('产物 dylib 未生成或过小')
+
+    report_log(job_id, '[%s] 产出 %s (%d KB)' % (tag, os.path.basename(out_file), os.path.getsize(out_file) // 1024))
+    return out_file
+
+
+def build_dylib(job):
+    """完整流程：固化配置 -> 编译两个平台 -> 签名 -> 打包，返回 zip 字节。"""
+    jid = job['id']
     app_id = job['app_id']
+    customer = job['customer']
+    secret = job['secret']
     cfg_url = BASE + '/api/config.php?app_id=' + app_id
     act_url = BASE + '/api/activate.php'
-    secret = job['secret']
-    customer = job['customer']
+
+    sdk_src = find_sdk_src()
+    if not sdk_src:
+        raise RuntimeError('worker 同级目录未找到 sdk_src')
 
     work = tempfile.mkdtemp(prefix='sclbuild_')
     try:
-        dst = os.path.join(work, 'sdk_src')
-        shutil.copytree(sdk_src, dst)
+        src = os.path.join(work, 'sdk_src')
+        shutil.copytree(sdk_src, src)
 
-        report_log(job['id'], '固化客户配置...')
-        cfg_file = os.path.join(dst, 'SCLAlertView', 'BackendControl', 'SCLCustomerConfig.swift')
-        s = open(cfg_file, encoding='utf-8').read()
+        # 固化客户配置
+        cfg_file = os.path.join(src, 'SCLAlertView', 'BackendControl', 'SCLCustomerConfig.swift')
+        if not os.path.isfile(cfg_file):
+            raise RuntimeError('缺少 SCLCustomerConfig.swift')
+        content = open(cfg_file, encoding='utf-8').read()
         for k, v in {
             '__SCL_CONFIG_URL__': cfg_url,
             '__SCL_ACTIVATE_URL__': act_url,
@@ -103,110 +203,133 @@ def build_dylib(job, sdk_src):
             '__SCL_SECRET__': secret,
             '__SCL_POLL__': '300',
         }.items():
-            s = s.replace(k, v)
-        open(cfg_file, 'w', encoding='utf-8').write(s)
+            content = content.replace(k, v)
+        open(cfg_file, 'w', encoding='utf-8').write(content)
+        report_log(jid, '客户配置已固化（域名/appID/密钥）')
 
-        report_log(job['id'], '编译 dylib（clang + swiftc）...')
-        subprocess.check_call(['chmod', '+x', os.path.join(dst, 'build_dylib.sh')])
-        # 直接调用构建脚本；脚本内部产出 zip
-        env = os.environ.copy()
-        proc = subprocess.run(
-            [os.path.join(dst, 'build_dylib.sh'), customer, cfg_url, act_url, app_id, secret, '300'],
-            cwd=dst, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800
-        )
-        for line in (proc.stdout or '').splitlines():
-            report_log(job['id'], line[:300])
-        if proc.returncode != 0:
-            raise RuntimeError('build_dylib.sh 退出码 %d' % proc.returncode)
+        outdir = os.path.join(work, 'output')
+        os.makedirs(os.path.join(outdir, 'iphoneos'), exist_ok=True)
+        os.makedirs(os.path.join(outdir, 'simulator'), exist_ok=True)
 
-        # 找产物 zip
-        zips = [f for f in os.listdir(dst) if f.endswith('_dylib.zip')]
-        if not zips:
-            # 也可能在 output 里
-            for root, _, fs in os.walk(dst):
-                zips += [os.path.join(root, f) for f in fs if f.endswith('_dylib.zip')]
-            zips = [z for z in zips if os.path.isfile(z)]
-        if not zips:
-            raise RuntimeError('未找到产物 zip')
+        dev = build_platform(src, jid, 'iphoneos', 'arm64-apple-ios13.0', 'arm64',
+                             os.path.join(outdir, 'iphoneos', 'SCLAlertView.dylib'), 'ios')
+        sim = build_platform(src, jid, 'iphonesimulator', 'arm64-apple-ios13.0-simulator', 'arm64',
+                             os.path.join(outdir, 'simulator', 'SCLAlertView.dylib'), 'sim')
 
-        zip_path = zips[0] if os.path.isabs(zips[0]) else os.path.join(dst, zips[0])
+        # ad-hoc 签名
+        for f in (dev, sim):
+            run(['codesign', '-f', '-s', '-', f])
+        report_log(jid, 'ad-hoc 签名完成')
+
+        # 校验 Mach-O
+        code, out = run(['file', dev, sim])
+        report_log(jid, '校验: ' + out.strip())
+
+        # 说明文件
+        with open(os.path.join(outdir, 'README.txt'), 'w', encoding='utf-8') as f:
+            f.write(
+                'SCLAlertView 成品动态库 (dylib)\n'
+                '================================\n'
+                '客户: %s\nApp ID: %s\n生成时间: %s\n\n'
+                '文件：\n'
+                '  iphoneos/SCLAlertView.dylib    真机 arm64\n'
+                '  simulator/SCLAlertView.dylib   模拟器 arm64\n\n'
+                '域名/AppID/密钥已固化进二进制。dylib 被加载时 constructor 自动连接后台并弹窗。\n\n'
+                '使用方式：\n'
+                '  真机：放入 App 的 Frameworks 目录，用 insert_dylib 注入 LC_LOAD_DYLIB，\n'
+                '        然后 codesign --force --sign <证书> 重签整个 App。\n'
+                '  模拟器：DYLD_INSERT_LIBRARIES=/path/SCLAlertView.dylib 启动。\n'
+                '  Frida：Module.load("/path/SCLAlertView.dylib")\n\n'
+                '配置接口: %s\n激活接口: %s\n'
+                % (customer, app_id, time.strftime('%Y-%m-%d %H:%M:%S'), cfg_url, act_url)
+            )
+        with open(os.path.join(outdir, 'config.json'), 'w', encoding='utf-8') as f:
+            json.dump({'customer': customer, 'app_id': app_id,
+                       'config_url': cfg_url, 'activate_url': act_url},
+                      f, ensure_ascii=False, indent=2)
+
+        # 打包 zip
+        zip_path = os.path.join(work, 'dylib.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            for dirpath, _, files in os.walk(outdir):
+                for fn in files:
+                    full = os.path.join(dirpath, fn)
+                    arc = os.path.relpath(full, outdir).replace('\\', '/')
+                    z.write(full, arc)
+
         with open(zip_path, 'rb') as f:
             return f.read()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ============ 任务处理 ============
+
 def process_one(job):
     jid = job['id']
-    print('领取任务', jid, job['customer'])
-    api({'action': 'claim', 'id': jid})
-    report_log(jid, '开始构建 ' + job['customer'])
+    print('领取任务', jid, job.get('customer'))
 
-    # 补齐 secret：create 时未带，从 pull 返回的 job 里取（后台 create 已含该客户信息时需带上）
-    if not job.get('secret'):
-        report_log(jid, '任务缺少 secret，尝试从构建包读取')
-        api({'action': 'fail', 'id': jid, 'error': '任务缺少 secret（请在 create 时写入客户密钥）'})
+    claim = api({'action': 'claim', 'id': jid})
+    if claim.get('error'):
+        print('claim 失败:', claim['error'])
         return
 
-    sdk = find_sdk_src()
-    if not sdk:
-        api({'action': 'fail', 'id': jid, 'error': 'worker 旁未找到 sdk_src 目录'})
+    report_log(jid, 'worker %s 开始构建 %s' % (WORKER_VERSION, job.get('customer')))
+
+    if not job.get('secret'):
+        api({'action': 'fail', 'id': jid, 'error': '任务缺少 secret'})
         return
 
     try:
-        report_log(jid, '编译 dylib（macOS）...')
-        zip_bytes = build_dylib(job, sdk)
-        report_log(jid, '回传产物 ' + str(len(zip_bytes) // 1024) + 'KB')
-        b64 = base64.b64encode(zip_bytes).decode()
-        # 用 POST 回传
-        ok = api({'action': 'finish', 'id': jid}, post={'file': b64})
-        if ok.get('error'):
-            raise RuntimeError('回传失败: ' + str(ok))
+        data = build_dylib(job)
+        report_log(jid, '构建完成，回传 %d KB' % (len(data) // 1024))
+        r = api({'action': 'finish', 'id': jid},
+                post={'file': base64.b64encode(data).decode()})
+        if r.get('error'):
+            raise RuntimeError('回传失败: ' + str(r['error']))
         print('完成', jid)
     except Exception as e:
-        api({'action': 'fail', 'id': jid, 'error': str(e)[:300]})
-        print('失败', jid, e)
+        msg = str(e)[:300]
+        api({'action': 'fail', 'id': jid, 'error': msg})
+        print('失败', jid, msg)
 
 
 def main():
-    print('SCL 构建 worker 启动')
+    print('SCL 构建 worker 启动，版本', WORKER_VERSION)
     print('  BASE  =', BASE)
     print('  TOKEN = 长度', len(TOKEN))
+    print('  SDK   =', find_sdk_src() or '(未找到 sdk_src)')
 
-    # 启动连通性自检：GitHub runner 能否访问你的站点
-    probe = api({'action': 'heartbeat', 'v': '1.2'})
+    probe = api({'action': 'heartbeat', 'v': WORKER_VERSION})
     if probe.get('error'):
         print('!! 连接站点失败:', probe['error'])
-        print('!! 请确认 SCL_BASE_URL 是公网可访问的 https 地址，且 /api/job.php 未被防火墙/CC 防护拦截')
+        print('!! 请确认 SCL_BASE_URL 是公网可访问的 https 地址，且未被防火墙拦截')
         if ONCE:
             sys.exit(1)
     else:
         print('== 站点连接正常 ==')
 
     while True:
-        # 每轮先上报心跳（让网页能看到节点是否在线）
-        hb = api({'action': 'heartbeat', 'v': '1.1'})
-        if hb.get('error'):
-            print('心跳失败:', hb['error'])
         r = api({'action': 'pull'})
         if r.get('error'):
-            print('API 错误:', r['error'])
+            print('拉取任务失败:', r['error'])
+            if ONCE:
+                sys.exit(1)
             time.sleep(10)
             continue
+
         job = r.get('job')
 
-        # 若 dispatch 指定了 job_id，直接拉取该任务（不依赖队列顺序）
-        forced = os.environ.get('SCL_JOB_ID', '').strip()
-        if forced:
-            one = api({'action': 'getjob', 'id': forced})
-            if one.get('job') and one['job'].get('status') == 'queued':
-                job = one['job']
-            elif one.get('job') and one['job'].get('status') == 'building':
-                print('任务已在构建中，跳过:', forced)
-                job = None
+        if FORCED_JOB:
+            one = api({'action': 'getjob', 'id': FORCED_JOB})
+            j = one.get('job')
+            if j and j.get('status') == 'queued':
+                job = j
             else:
-                print('指定任务不可用:', one)
-                job = None
+                print('指定任务不可用，改为队列顺序')
+                if not job:
+                    print('无待处理任务，退出')
+                    break
 
         if not job:
             if ONCE:
@@ -214,6 +337,7 @@ def main():
                 break
             time.sleep(5)
             continue
+
         process_one(job)
         if ONCE:
             break
