@@ -1,26 +1,23 @@
-# ============================================================
-# SCLAlertView 云端自动打包工作流
-# 放到仓库的 .github/workflows/scl-build.yml
-#
-# 重要：本工作流只做一件事 —— 运行 python3 worker.py。
-# 它【不会】执行 xcodebuild -list，也不需要仓库根目录有 Xcode 工程。
-# 如果你在日志里看到 "xcodebuild -list" 或 Ruby JSON 解析报错，
-# 说明跑的是别的工作流，请把 .github/workflows/ 里其它文件删掉。
-# ============================================================
-
 name: SCL Dylib Auto Build
 
 on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: '任务ID（留空自动领取队列第一个）'
+        description: '任务ID（可留空）'
+        required: false
+        default: ''
+      base_url:
+        description: '临时覆盖站点地址（可留空，优先用 Secret）'
+        required: false
+        default: ''
+      worker_token:
+        description: '临时覆盖 Worker Token（可留空，优先用 Secret）'
         required: false
         default: ''
   schedule:
     - cron: '*/5 * * * *'
 
-# 同一时间只跑一个，避免并发抢任务
 concurrency:
   group: scl-build
   cancel-in-progress: false
@@ -30,37 +27,35 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: 环境自检（失败会明确告诉你缺什么）
+      - name: 检查文件与密钥
+        env:
+          SCL_BASE_URL: ${{ github.event.inputs.base_url || secrets.SCL_BASE_URL }}
+          SCL_WORKER_TOKEN: ${{ github.event.inputs.worker_token || secrets.SCL_WORKER_TOKEN }}
         run: |
-          echo "当前目录: $(pwd)"
-          echo "========== 仓库根目录 =========="
           ls -la
-          echo "========== .github/workflows =========="
-          ls -la .github/workflows || true
-          echo "========== 检查必需文件 =========="
-          if [ ! -f worker.py ]; then
-            echo "::error::仓库根目录缺少 worker.py（应在上传包 GITHUB-repo-upload.zip 里）"
+          test -f worker.py || { echo "::error::仓库根目录缺少 worker.py"; exit 1; }
+          test -d sdk_src   || { echo "::error::仓库根目录缺少 sdk_src 目录"; exit 1; }
+          if [ -z "$SCL_BASE_URL" ]; then
+            echo "::error::SCL_BASE_URL 为空。请在仓库 Settings > Secrets and variables > Actions 新建 Secret：SCL_BASE_URL = 你的站点根地址（https://你的域名，不要带 /admin 或 /api）"
             exit 1
           fi
-          if [ ! -d sdk_src ]; then
-            echo "::error::仓库根目录缺少 sdk_src 目录"
+          if [ -z "$SCL_WORKER_TOKEN" ]; then
+            echo "::error::SCL_WORKER_TOKEN 为空。请先到 PHP 后台「构建节点设置」生成并保存 Token，再到 GitHub 新建同名 Secret"
             exit 1
           fi
-          echo "worker.py 和 sdk_src 存在，开始构建"
-          ls -la sdk_src | head -50
+          echo "base_url = $SCL_BASE_URL"
+          echo "token_length = ${#SCL_WORKER_TOKEN}"
 
       - name: 运行构建 worker
         env:
-          SCL_BASE_URL: ${{ secrets.SCL_BASE_URL }}
-          SCL_WORKER_TOKEN: ${{ secrets.SCL_WORKER_TOKEN }}
+          SCL_BASE_URL: ${{ github.event.inputs.base_url || secrets.SCL_BASE_URL }}
+          SCL_WORKER_TOKEN: ${{ github.event.inputs.worker_token || secrets.SCL_WORKER_TOKEN }}
           SCL_JOB_ID: ${{ github.event.inputs.job_id }}
           SCL_ONCE: '1'
         run: python3 worker.py
