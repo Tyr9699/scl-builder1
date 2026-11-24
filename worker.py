@@ -138,6 +138,19 @@ def download_sdk(dest_dir):
     return target
 
 
+def safe_lib_name(raw):
+    """校验自定义动态库名称，与 PHP scl_dylib_name 规则一致。"""
+    import re
+    n = str(raw or '').strip()
+    n = re.sub(r'\.dylib$', '', n, flags=re.I)
+    n = re.sub(r'[^A-Za-z0-9_-]', '', n)
+    if not n or len(n) > 64:
+        return 'SCLAlertView'
+    if n.startswith('-'):
+        n = 'D' + n
+    return n
+
+
 def sdk_path(name):
     code, out = run(['xcrun', '--sdk', name, '--show-sdk-path'])
     if code != 0:
@@ -145,8 +158,10 @@ def sdk_path(name):
     return out.strip()
 
 
-def build_platform(src_dir, job_id, sdk_name, triple, arch, out_file, tag):
-    """编译单个平台的 dylib。分 clang 编 ObjC、swiftc 链接两步，绕开 SwiftPM 混合语言限制。"""
+def build_platform(src_dir, job_id, sdk_name, triple, arch, out_file, tag, lib_name):
+    """编译单个平台的 dylib。分 clang 编 ObjC、swiftc 链接两步，绕开 SwiftPM 混合语言限制。
+    lib_name 只用于产物文件名与 install_name；Swift module name 固定 SCLAlertView，
+    否则 @objc 类名 SCLAlertView.SCLDylibBridge 会找不到。"""
     root = os.path.join(src_dir, 'SCLAlertView')
     objc_file = os.path.join(root, 'BackendControl', 'SCLDylibEntry.m')
     swift_files = []
@@ -185,7 +200,7 @@ def build_platform(src_dir, job_id, sdk_name, triple, arch, out_file, tag):
            '-module-name', 'SCLAlertView',
            '-target', triple, '-sdk', sdk,
            '-framework', 'UIKit', '-framework', 'Foundation',
-           '-Xlinker', '-install_name', '-Xlinker', '@rpath/SCLAlertView.dylib',
+           '-Xlinker', '-install_name', '-Xlinker', '@rpath/' + lib_name + '.dylib',
            '-Xlinker', '-rpath', '-Xlinker', '/usr/lib/swift',
            '-o', out_file] + swift_files + [objc_obj]
     code, out = run(cmd)
@@ -208,8 +223,11 @@ def build_dylib(job):
     app_id = job['app_id']
     customer = job['customer']
     secret = job['secret']
+    lib_name = safe_lib_name(job.get('dylib_name'))
+    dylib_file = lib_name + '.dylib'
     cfg_url = BASE + '/api/config.php?app_id=' + app_id
     act_url = BASE + '/api/activate.php'
+    report_log(jid, '动态库名称: ' + dylib_file)
 
     work = tempfile.mkdtemp(prefix='sclbuild_')
     try:
@@ -246,9 +264,9 @@ def build_dylib(job):
         os.makedirs(os.path.join(outdir, 'simulator'), exist_ok=True)
 
         dev = build_platform(src, jid, 'iphoneos', 'arm64-apple-ios13.0', 'arm64',
-                             os.path.join(outdir, 'iphoneos', 'SCLAlertView.dylib'), 'ios')
+                             os.path.join(outdir, 'iphoneos', dylib_file), 'ios', lib_name)
         sim = build_platform(src, jid, 'iphonesimulator', 'arm64-apple-ios13.0-simulator', 'arm64',
-                             os.path.join(outdir, 'simulator', 'SCLAlertView.dylib'), 'sim')
+                             os.path.join(outdir, 'simulator', dylib_file), 'sim', lib_name)
 
         # ad-hoc 签名
         for f in (dev, sim):
@@ -259,49 +277,77 @@ def build_dylib(job):
         code, out = run(['file', dev, sim])
         report_log(jid, '校验: ' + out.strip())
 
-        # 说明文件
+        # 说明文件（用 f-string 拼接，避免 % 占位符计数出错）
+        fp = '@executable_path/Frameworks/' + dylib_file
+        generated = time.strftime('%Y-%m-%d %H:%M:%S')
+        readme = f'''{lib_name} 成品动态库 (dylib)
+================================
+客户: {customer}
+App ID: {app_id}
+动态库: {dylib_file}
+生成时间: {generated}
+
+文件：
+  iphoneos/{dylib_file}    真机 arm64
+  simulator/{dylib_file}   模拟器 arm64
+
+域名/AppID/密钥已固化进二进制。dylib 被加载时 constructor 自动连接后台并弹窗。
+注意：Swift module 名固定 SCLAlertView，所以内部类名不变，只有文件名/加载路径自定义。
+
+【防移除保护（默认开启）】
+  inject.sh 默认 MODE=strong 强链接：
+    用户删除/替换 Frameworks/{dylib_file} -> App 启动即崩溃，等于剥离不了后台控制。
+  如需调试可 MODE=weak ./inject.sh ... 改为弱链接。
+
+【三个脚本（已自动适配库名）】
+  inject.sh            注入（强链接，发货用）
+  check_protection.sh  发货前自检保护是否生效
+  uninject.sh          内部剥离注入
+
+【真机注入】
+  chmod +x *.sh
+  ./inject.sh app.ipa iphoneos/{dylib_file} "签名证书名" out.ipa
+  ./check_protection.sh out.ipa
+
+手动注入（注意顺序，且不加 --weak）：
+  1) cp {dylib_file} Payload/App.app/Frameworks/
+  2) insert_dylib --inplace --all-yes {fp} Payload/App.app/App
+  3) codesign -f -s "证书" Payload/App.app/Frameworks/{dylib_file}
+  4) codesign -f -s "证书" Payload/App.app
+
+验证加载（连设备看日志，过滤 SCLDylib）：
+  mac: idevicesyslog | grep SCLDylib
+
+模拟器：DYLD_INSERT_LIBRARIES=/path/{dylib_file} 启动。
+Frida：Module.load("/path/{dylib_file}")
+
+配置接口: {cfg_url}
+激活接口: {act_url}
+'''
         with open(os.path.join(outdir, 'README.txt'), 'w', encoding='utf-8') as f:
-            f.write(
-                'SCLAlertView 成品动态库 (dylib)\n'
-                '================================\n'
-                '客户: %s\nApp ID: %s\n生成时间: %s\n\n'
-                '文件：\n'
-                '  iphoneos/SCLAlertView.dylib    真机 arm64\n'
-                '  simulator/SCLAlertView.dylib   模拟器 arm64\n\n'
-                '域名/AppID/密钥已固化进二进制。dylib 被加载时 constructor 自动连接后台并弹窗。\n\n'
-                '推荐用法（真机注入，一条命令）：\n'
-                '  chmod +x inject.sh\n'
-                '  ./inject.sh app.ipa iphoneos/SCLAlertView.dylib "签名证书名" out.ipa\n'
-                '  脚本会自动校验架构、注入、按正确顺序重签、并验证 LC_LOAD_DYLIB。\n\n'
-                '手动注入（注意顺序）：\n'
-                '  1) cp SCLAlertView.dylib Payload/App.app/Frameworks/\n'
-                '  2) insert_dylib --inplace --all-yes @executable_path/Frameworks/SCLAlertView.dylib Payload/App.app/App\n'
-                '  3) codesign -f -s "证书" Payload/App.app/Frameworks/SCLAlertView.dylib\n'
-                '  4) codesign -f -s "证书" Payload/App.app\n'
-                '  不要加 --weak，否则加载失败会被静默忽略，表现为"注入没效果"。\n\n'
-                '验证是否真的加载了（连设备看日志，过滤 SCLDylib）：\n'
-                '  mac: idevicesyslog | grep SCLDylib\n'
-                '  正常会打印: [SCLDylib] constructor 已触发 / 配置已固化=true / 后台连通正常\n\n'
-                '模拟器：DYLD_INSERT_LIBRARIES=/path/SCLAlertView.dylib 启动。\n'
-                'Frida：Module.load("/path/SCLAlertView.dylib")\n\n'
-                '配置接口: %s\n激活接口: %s\n'
-                % (customer, app_id, time.strftime('%Y-%m-%d %H:%M:%S'), cfg_url, act_url)
-            )
+            f.write(readme)
         with open(os.path.join(outdir, 'config.json'), 'w', encoding='utf-8') as f:
             json.dump({'customer': customer, 'app_id': app_id,
+                       'dylib_name': lib_name, 'dylib_file': dylib_file,
                        'config_url': cfg_url, 'activate_url': act_url},
                       f, ensure_ascii=False, indent=2)
 
-        # 附带注入脚本，客户/自己一条命令完成注入
-        inject_src = os.path.join(src, 'tools', 'inject.sh')
-        if os.path.isfile(inject_src):
-            inject_dst = os.path.join(outdir, 'inject.sh')
-            shutil.copy(inject_src, inject_dst)
-            try:
-                os.chmod(inject_dst, 0o755)
-            except Exception:
-                pass
-            report_log(jid, '已附带 inject.sh 注入脚本')
+        # 附带注入 / 移除脚本；脚本统一读取 libname.conf 里的库名
+        tools_dir = os.path.join(src, 'tools')
+        if os.path.isdir(tools_dir):
+            for fn in sorted(os.listdir(tools_dir)):
+                sp = os.path.join(tools_dir, fn)
+                if not os.path.isfile(sp):
+                    continue
+                dp = os.path.join(outdir, fn)
+                shutil.copy(sp, dp)
+                try:
+                    os.chmod(dp, 0o755)
+                except Exception:
+                    pass
+            with open(os.path.join(outdir, 'libname.conf'), 'w', encoding='utf-8') as cf:
+                cf.write('DYLIB_NAME="%s"\nDYLIB_FILE="%s"\n' % (lib_name, dylib_file))
+            report_log(jid, '已附带注入脚本并写入库名配置 ' + dylib_file)
 
         # 打包 zip
         zip_path = os.path.join(work, 'dylib.zip')
